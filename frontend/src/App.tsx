@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AlertDrawer from "./components/AlertDrawer";
 import LiveGraph, { GraphNode, GraphLink } from "./components/LiveGraph";
 import ActivityChart, { ActivityPoint } from "./components/ActivityChart";
-import DemoPanel from "./components/DemoPanel";
+// ARENA: ARENA_LAUNCH_EVENT is fired by the Attack Arena in DemoPanel
+import DemoPanel, { ARENA_LAUNCH_EVENT, type ArenaLaunchDetail } from "./components/DemoPanel";
 import ThreatTypeMenu from "./components/ThreatTypeMenu";
 
 import { SHOW_SHAPE_EVENT } from "./components/AlertFeed";
@@ -32,14 +33,18 @@ const SCENARIO_TYPE: Record<string, string> = {
 };
 
 // What the topology graph is showing, in plain words
+// SHAPES: every threat type now has its own shape
 const SHAPE_NAME: Record<string, string> = {
-  PortScan: "star pattern: one host probing many targets",
-  DDoS: "hub pattern: many sources converging on one target",
-  DGA: "fan-out pattern: one host contacting many one-off destinations",
-  C2Beaconing: "repeating edge: a fixed check-in to one controller",
-  DNSTunneling: "oversized DNS edge: one host to one resolver",
-  Exfiltration: "outbound burst: one host to one external destination",
+  PortScan: "star: one host probing many hosts and ports",
+  DDoS: "funnel: many sources converging on one target",
+  DGA: "comb: one host fanning out to many one-off destinations",
+  C2Beaconing: "ring: a repeating check-in and reply loop with one controller",
+  DNSTunneling: "pipeline: oversized DNS queries flowing to one resolver",
+  Exfiltration: "diamond: a burst of outbound transfers to one external destination",
 };
+
+// SHAPES: only these shapes have a single "centre" node (the scanner / the target / the bot)
+const CENTERED_TYPES = new Set(["PortScan", "DDoS", "DGA"]);
 
 // ---------------------------------------------------------------------------
 // The topology graph shows ONE shape: the threat being detected right now.
@@ -118,6 +123,8 @@ export default function App() {
   const seqRef = useRef(0);
   const alertsRef = useRef<Alert[]>([]);
   const launchNextRef = useRef<() => void>(() => {});
+  // ARENA: while true, only messages tagged origin="arena" are shown (live monitoring is ignored)
+  const arenaLockRef = useRef(false);
   liveModeRef.current = liveMode;
   isRunningRef.current = isRunning;
   alertsRef.current = alerts;
@@ -133,10 +140,13 @@ export default function App() {
     }
     let centerId: string | null = null;
     let best = 2; // a centre needs at least 3 connections
-    for (const [id, d] of degree) {
-      if (d > best) {
-        best = d;
-        centerId = id;
+    // SHAPES: ring / pipeline / diamond have two equal endpoints, so only star, funnel and comb get a centre
+    if (shape.type && CENTERED_TYPES.has(shape.type)) {
+      for (const [id, d] of degree) {
+        if (d > best) {
+          best = d;
+          centerId = id;
+        }
       }
     }
     const nodes: GraphNode[] = shape.nodes.map((n) => ({ ...n, center: n.id === centerId }));
@@ -186,6 +196,31 @@ export default function App() {
     return () => window.removeEventListener(SHOW_SHAPE_EVENT, onShowShape);
   }, []);
 
+  // ARENA: an Attack Arena launch -> pause live monitoring, clear the graph, show only Arena events.
+  useEffect(() => {
+    const onArenaLaunch = (e: Event) => {
+      const d = (e as CustomEvent<ArenaLaunchDetail>).detail;
+      arenaLockRef.current = true;
+      liveModeRef.current = false;
+      setLiveMode(false);
+      setFocusType(null);
+      setShape(EMPTY_SHAPE);
+      setIsComplete(false);
+      setStageText(null);
+      lastLaunchRef.current = Date.now();
+      if (d) {
+        const label = THREAT_INFO[d.type]?.label ?? d.type;
+        setStatus(
+          d.mode === "killchain"
+            ? `Attack Arena: kill chain from ${d.attacker_ip}`
+            : `Attack Arena: ${label}${d.type === "DDoS" ? ` on ${d.target_ip}` : ` from ${d.attacker_ip}`}`
+        );
+      }
+    };
+    window.addEventListener(ARENA_LAUNCH_EVENT, onArenaLaunch);
+    return () => window.removeEventListener(ARENA_LAUNCH_EVENT, onArenaLaunch);
+  }, []);
+
   useEffect(() => {
     fetch(`${API_BASE}/api/alerts`)
       .then((res) => {
@@ -218,6 +253,11 @@ export default function App() {
 
       ws.onmessage = (event) => {
         const msg: WsMessage = JSON.parse(event.data);
+
+        // ARENA: while an Arena attack is on screen, drop everything that is not from the Arena
+        const origin = (msg as unknown as { origin?: string }).origin;
+        if (arenaLockRef.current && origin !== "arena") return;
+
         switch (msg.event) {
           case "stage_announcement":
             setStageText(msg.text ?? null);
@@ -259,6 +299,7 @@ export default function App() {
   }, [pushHistoryPoint]);
 
   const resetForNewRun = () => {
+    arenaLockRef.current = false; // ARENA: any normal run (or Clear) releases the Arena lock
     lastLaunchRef.current = Date.now();
     setIsComplete(false);
     setStageText(null);
@@ -335,6 +376,7 @@ export default function App() {
 
   const toggleLive = () => {
     lastLaunchRef.current = 0; // start the first scan right away
+    if (!liveModeRef.current) arenaLockRef.current = false; // ARENA: turning live monitoring back ON releases the lock
     setLiveMode((v) => !v);
   };
 
@@ -351,6 +393,7 @@ export default function App() {
     if (!liveMode || !connected) return;
     const id = window.setInterval(() => {
       if (isRunningRef.current) return;
+      if (arenaLockRef.current) return; // ARENA: never start live scans while an Arena attack is on screen
       if (Date.now() - lastLaunchRef.current < LIVE_INTERVAL_MS) return;
       launchNextRef.current();
     }, 1000);
@@ -498,7 +541,8 @@ export default function App() {
 </div>
         </div>
 
-        <LiveGraph nodes={graph.nodes} links={graph.links}>
+        {/* SHAPES: shapeType tells the graph which fixed layout to use */}
+        <LiveGraph nodes={graph.nodes} links={graph.links} shapeType={shape.type}>
           {graph.nodes.length === 0 && (
             <div className="empty">
               <div className="empty-title">No active threat shape</div>

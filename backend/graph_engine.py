@@ -6,25 +6,27 @@ nodes, connections become edges — and looks at how the SHAPE of that graph
 changes to spot attacks, on top of (and independent from) any single-flow
 check.
 
-Shapes we're looking for:
-    Port scan  -> "star": one node fans out to MANY targets (horizontal
-                  sweep) and/or hits MANY ports on one target (vertical scan)
-    DDoS       -> "hub": one node receives edges from MANY distinct sources
-    C2/Botnet  -> repeated edge between the same pair, at suspiciously
-                  REGULAR time intervals ("beaconing")
-    DGA        -> one node has edges to MANY distinct destination nodes on
-                  DNS, each contacted only once or twice
-    Exfil      -> one node's outbound byte volume is a big outlier
-                  compared to every other node in the graph
+Every threat has its OWN drawable shape (see alert_to_graph_elements):
 
-Every alert that describes a star or hub also carries the full list of
-nodes involved ("targets" / "ports" / "sources"), so the dashboard can
-actually DRAW the shape. Use alert_to_graph_elements(alert) to turn an
-alert into (nodes, links) for the frontend.
+    PortScan      -> STAR      one scanner, spokes to many hosts and ports
+    DDoS          -> FUNNEL    many sources converging on one target
+    DGA           -> COMB      one bot fanning out to many one-off destinations
+    C2Beaconing   -> RING      bot -> check-ins -> C2 -> replies -> bot (a loop)
+    DNSTunneling  -> PIPELINE  source -> oversized queries in a row -> resolver
+    Exfiltration  -> DIAMOND   source -> burst of outbound transfers -> destination
+
+The nodes of a ring / pipeline / diamond between the two real hosts stand
+for the repeated flows that were observed (check-ins, queries, bursts).
+They are a drawing aid, not extra hosts. The dashboard pins every node to a
+fixed position per shape (frontend/src/shapeLayout.ts).
+
+PHASE 1 addition: node attack-state machine (next_node_state), see the
+block just above the standalone test.
 """
 
 from __future__ import annotations
 
+import re
 import statistics
 
 import networkx as nx
@@ -213,6 +215,7 @@ def detect_c2_beaconing(G: nx.DiGraph, min_beacons: int = 5, regularity_threshol
                 "type": "C2Beaconing",
                 "source": src,
                 "target": dst,
+                "count": len(ts_list),  # how many check-ins were seen (used to draw the ring)
                 "evidence": (
                     f"{src} contacted {dst} {len(ts_list)} times at "
                     f"~{statistics.mean(gaps):.1f}s intervals (very regular)"
@@ -258,6 +261,7 @@ def detect_exfiltration(G: nx.DiGraph, zscore_threshold: float = 2.0, min_bytes:
             }
             if top_dst is not None:
                 alert["target"] = top_dst[1]
+                alert["count"] = top_dst[2]["flow_count"]  # how many transfers (used to draw the diamond)
             alerts.append(alert)
     return alerts
 
@@ -280,6 +284,7 @@ def detect_dns_tunneling(G: nx.DiGraph, min_avg_bytes: int = 500, min_flows: int
                 "type": "DNSTunneling",
                 "source": src,
                 "target": dst,
+                "count": data["flow_count"],  # how many oversized queries (used to draw the pipeline)
                 "evidence": (
                     f"{src} sent {data['flow_count']} DNS flows to {dst} averaging "
                     f"{avg_bytes:.0f} bytes each (normal DNS is much smaller)"
@@ -305,28 +310,48 @@ def get_graph_anomalies(G: nx.DiGraph) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Alert -> drawable graph elements (for the dashboard)
 # ---------------------------------------------------------------------------
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+def _count_of(alert: dict, pattern: str, default: int) -> int:
+    """How many flows an alert is about: the 'count' field, else parsed from the evidence text."""
+    c = alert.get("count")
+    if isinstance(c, (int, float)) and c > 0:
+        return int(c)
+    ev = alert.get("evidence")
+    text = " ".join(ev) if isinstance(ev, list) else str(ev or "")
+    m = re.search(pattern, text)
+    return int(m.group(1)) if m else default
+
+
 def alert_to_graph_elements(alert: dict) -> tuple[list[dict], list[dict]]:
     """
     Expand ONE graph alert into (nodes, links) the frontend can draw.
+    Each threat type gets its own shape:
 
-      PortScan (horizontal) -> scanner -> every probed host      (star)
-      PortScan (vertical)   -> scanner -> target + target:port   (star)
-      DDoS                  -> every source -> target            (hub)
-      DGA                   -> bot -> every contacted host       (fan-out)
-      others                -> plain source -> target edge
+      PortScan     STAR      scanner -> every probed host / host:port
+      DDoS         FUNNEL    every source -> target
+      DGA          COMB      bot -> every contacted destination
+      C2Beaconing  RING      src -> check-in 1..k -> dst -> reply 1..k -> src
+      DNSTunneling PIPELINE  src -> query 1..k -> resolver
+      Exfiltration DIAMOND   src -> burst 1..k -> destination
 
     Nodes are de-duplicated by id and match the frontend's GraphNode shape
-    {id, flagged, types, primaryType}; links match GraphLink
-    {source, target, type}. Every link endpoint is guaranteed to exist in
-    the returned nodes list (react-force-graph needs that).
+    {id, flagged, types, primaryType} plus optional drawing hints:
+      key   - an important endpoint: drawn bigger and always labelled
+      minor - a spoke or pulse node: drawn small
+      label - text to show instead of the id
+    Links match GraphLink {source, target, type}. Every link endpoint is
+    guaranteed to exist in the returned nodes list (react-force-graph needs that).
     """
     t = alert["type"]
     nodes: dict[str, dict] = {}
     links: list[dict] = []
 
-    def add_node(node_id: str):
+    def add_node(node_id: str, **extra):
         if node_id and node_id not in nodes:
-            nodes[node_id] = {"id": node_id, "flagged": True, "types": [t], "primaryType": t}
+            nodes[node_id] = {"id": node_id, "flagged": True, "types": [t], "primaryType": t, **extra}
 
     def add_link(src: str, dst: str):
         if src and dst:
@@ -334,34 +359,126 @@ def alert_to_graph_elements(alert: dict) -> tuple[list[dict], list[dict]]:
             add_node(dst)
             links.append({"source": src, "target": dst, "type": t})
 
-    if t == "PortScan":
-        src = alert.get("source")
-        for dst in alert.get("targets", []):
-            add_link(src, dst)
+    src, dst = alert.get("source"), alert.get("target")
+
+    if t == "PortScan":  # STAR
+        add_node(src, key=True)
+        for host in alert.get("targets", []):
+            add_node(host, minor=True)
+            add_link(src, host)
         if alert.get("ports"):
-            dst = alert.get("target")
+            add_node(dst, key=True)
             add_link(src, dst)
             for p in alert["ports"]:
-                add_link(src, f"{dst}:{p}")
+                pid = f"{dst}:{p}"
+                add_node(pid, minor=True, label=f":{p}")
+                add_link(src, pid)
 
-    elif t == "DDoS":
-        target = alert.get("target")
+    elif t == "DDoS":  # FUNNEL
+        add_node(dst, key=True)
         for s in alert.get("sources", []):
-            add_link(s, target)
+            add_node(s, minor=True)
+            add_link(s, dst)
 
-    elif t == "DGA":
-        src = alert.get("source")
-        for dst in alert.get("targets", []):
-            add_link(src, dst)
+    elif t == "DGA":  # COMB
+        add_node(src, key=True)
+        for d in alert.get("targets", []):
+            add_node(d, minor=True)
+            add_link(src, d)
 
-    else:
-        add_link(alert.get("source"), alert.get("target"))
-        if alert.get("source"):
-            add_node(alert["source"])
-        if alert.get("target"):
-            add_node(alert["target"])
+    elif t == "C2Beaconing" and src and dst:  # RING: src -> check-ins -> dst -> replies -> src
+        k = _clamp(_count_of(alert, r"(\d+)\s+times", 4), 3, 6)
+        base = f"{src}>{dst}"
+        add_node(src, key=True)
+        add_node(dst, key=True)
+        prev = src
+        for i in range(1, k + 1):
+            nid = f"{base}~req{i}"
+            add_node(nid, minor=True, label=f"check-in {i}")
+            add_link(prev, nid)
+            prev = nid
+        add_link(prev, dst)
+        prev = dst
+        for i in range(1, k + 1):
+            nid = f"{base}~ack{i}"
+            add_node(nid, minor=True, label=f"reply {i}")
+            add_link(prev, nid)
+            prev = nid
+        add_link(prev, src)
+
+    elif t == "DNSTunneling" and src and dst:  # PIPELINE: src -> query 1..k -> resolver
+        k = _clamp(_count_of(alert, r"sent\s+(\d+)\s+DNS", 4), 3, 6)
+        base = f"{src}>{dst}"
+        add_node(src, key=True)
+        prev = src
+        for i in range(1, k + 1):
+            nid = f"{base}~dns{i}"
+            add_node(nid, minor=True, label=f"query {i}")
+            add_link(prev, nid)
+            prev = nid
+        add_node(dst, key=True)
+        add_link(prev, dst)
+
+    elif t == "Exfiltration" and src and dst:  # DIAMOND: src -> burst 1..k -> destination
+        k = _clamp(_count_of(alert, r"(\d+)\s+(?:flows|transfers)", 5), 3, 7)
+        base = f"{src}>{dst}"
+        add_node(src, key=True)
+        add_node(dst, key=True)
+        for i in range(1, k + 1):
+            nid = f"{base}~burst{i}"
+            add_node(nid, minor=True, label=f"burst {i}")
+            add_link(src, nid)
+            add_link(nid, dst)
+
+    else:  # anything else (or an alert without both ends): plain source -> target edge
+        add_link(src, dst)
+        if src:
+            add_node(src)
+        if dst:
+            add_node(dst)
 
     return list(nodes.values()), links
+
+
+# ===========================================================================
+# PHASE 1: node attack-state machine (pure logic, persistence lives in
+# database.py / campaigns.py)
+#
+#   normal -> suspicious -> compromised -> quarantined
+#
+#   suspicious   : any alert with confidence >= 0.70
+#   compromised  : 2+ distinct MITRE tactics from the same host, OR one
+#                  severe tactic (C2 / Exfiltration / Impact) at >= 0.80
+#   quarantined  : set ONLY by an analyst response (never automatically)
+# ===========================================================================
+NODE_STATE_RANK = {"normal": 0, "suspicious": 1, "compromised": 2, "quarantined": 3}
+SEVERE_TACTICS = {"Command and Control", "Exfiltration", "Impact"}
+SUSPICIOUS_CONF = 0.70
+COMPROMISED_CONF = 0.80
+
+
+def next_node_state(
+    current: str,
+    confidence: float,
+    tactics_seen: set[str],
+    latest_tactic: str | None = None,
+) -> str:
+    """Return the new state for a host after one more alert. Never downgrades."""
+    if current == "quarantined":
+        return current  # the analyst's decision is final
+
+    new = current if current in NODE_STATE_RANK else "normal"
+
+    if confidence >= SUSPICIOUS_CONF and NODE_STATE_RANK[new] < NODE_STATE_RANK["suspicious"]:
+        new = "suspicious"
+
+    escalate = len(tactics_seen) >= 2 or (
+        latest_tactic in SEVERE_TACTICS and confidence >= COMPROMISED_CONF
+    )
+    if escalate:
+        new = "compromised"
+
+    return new
 
 
 # ---------------------------------------------------------------------------

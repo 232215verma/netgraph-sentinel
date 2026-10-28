@@ -9,6 +9,9 @@ Runs ALL FOUR layers on flow data:
 
 Then combines them: when multiple layers flag the same
 (threat type, source/target), confidence goes up.
+
+PHASE 1 addition: MITRE tactic mapping + campaign severity helpers
+(pure functions, see the block above the __main__ section).
 """
 
 import sys
@@ -142,6 +145,44 @@ def detect(csv_path: str) -> list[dict]:
         flows["timestamp"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
     )
     return detect_flows(flows)
+
+
+# ===========================================================================
+# PHASE 1: MITRE ATT&CK tactic mapping + campaign severity
+# ===========================================================================
+# threat_type -> (tactic name, tactic id)
+TACTIC_MAP = {
+    "PortScan": ("Reconnaissance", "TA0043"),
+    "C2Beaconing": ("Command and Control", "TA0011"),
+    "DGA": ("Command and Control", "TA0011"),
+    "DNSTunneling": ("Command and Control", "TA0011"),
+    "Exfiltration": ("Exfiltration", "TA0010"),
+    "DDoS": ("Impact", "TA0040"),
+}
+
+_SEVERITY_LEVELS = ["low", "medium", "high", "critical"]
+
+
+def tactic_for(threat_type: str) -> tuple[str, str] | None:
+    """MITRE tactic (name, id) for a threat type, or None (e.g. generic 'Anomaly')."""
+    return TACTIC_MAP.get(threat_type)
+
+
+def campaign_severity(stages: list[dict]) -> str:
+    """
+    Base level from the strongest stage confidence, then raised by how many
+    distinct tactics the same host has shown (2 tactics = +1, 3+ = critical).
+    """
+    if not stages:
+        return "low"
+    top = max(s["confidence"] for s in stages)
+    level = 2 if top >= 0.90 else 1 if top >= 0.75 else 0
+    n = len({s["tactic"] for s in stages})
+    if n >= 3:
+        level = 3
+    elif n == 2:
+        level = min(3, level + 1)
+    return _SEVERITY_LEVELS[level]
 
 
 if __name__ == "__main__":

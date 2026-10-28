@@ -19,6 +19,9 @@ Usage:
     python traffic_generator.py                      # benign + all 6 attacks
     python traffic_generator.py --attack portscan     # benign + just portscan
     python traffic_generator.py --out ../data/my.csv  # custom output path
+
+PHASE 1 addition: generate_attack_flows() + KILL_CHAIN for the Attack Arena
+(see the block just above build_dataset).
 """
 
 import argparse
@@ -307,6 +310,58 @@ ATTACK_GENERATORS = {
     "dnstunnel": generate_dns_tunneling,
     "exfil": generate_data_exfiltration,
 }
+
+
+# ===========================================================================
+# PHASE 1: Attack Arena support
+# ===========================================================================
+# Names the dashboard sends  ->  keys of ATTACK_GENERATORS
+ARENA_KINDS = {
+    "PortScan": "portscan",
+    "DDoS": "ddos",
+    "C2Beaconing": "c2",
+    "DGA": "dga",
+    "DNSTunneling": "dnstunnel",
+    "Exfiltration": "exfil",
+}
+
+# Documentation-range IP (RFC 5737) used as the external C2 / drop server
+EXTERNAL_C2_IP = "203.0.113.10"
+
+# Kill chain: (delay in seconds from start, attack kind, destination)
+#   "target"   -> the victim IP chosen in the dashboard
+#   "external" -> EXTERNAL_C2_IP (C2 server and exfil drop point are outside)
+KILL_CHAIN = [
+    (0, "PortScan", "target"),
+    (8, "C2Beaconing", "external"),
+    (20, "Exfiltration", "external"),
+]
+
+
+def generate_attack_flows(kind: str, attacker_ip: str, dst_ip: str,
+                          start_time: datetime) -> list[dict]:
+    """
+    Run ONE attack generator with the attacker/destination the analyst
+    chose. `kind` is a dashboard name (e.g. "PortScan").
+
+    DDoS has no single attacker (the shape is MANY sources -> one target),
+    so for it only dst_ip is used.
+    """
+    key = ARENA_KINDS[kind]
+    if key == "portscan":
+        return generate_port_scan(start_time, attacker_ip=attacker_ip, target_ip=dst_ip)
+    if key == "ddos":
+        return generate_ddos(start_time, target_ip=dst_ip)
+    if key == "c2":
+        # 12 beacons, 10 s apart: regular enough to trip the beaconing detector quickly
+        return generate_c2_beaconing(start_time, bot_ip=attacker_ip, c2_ip=dst_ip,
+                                     num_beacons=12, interval_seconds=10)
+    if key == "dga":
+        return generate_dga_domains(start_time, bot_ip=attacker_ip)
+    if key == "dnstunnel":
+        return generate_dns_tunneling(start_time, source_ip=attacker_ip, dns_server_ip=dst_ip)
+    return generate_data_exfiltration(start_time, source_ip=attacker_ip, dest_ip=dst_ip)
+# ===========================================================================
 
 
 def build_dataset(attacks: list[str], benign_count: int = 300) -> pd.DataFrame:

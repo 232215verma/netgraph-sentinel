@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import AlertFeed from "./AlertFeed";
 import SummaryReport from "./SummaryReport";
+// Phase 1: campaign timeline + tamper-evident ledger panel
+import CampaignTimeline from "./CampaignTimeline";
+import LedgerPanel from "./LedgerPanel";
 import { Alert } from "../types";
 import { THREAT_INFO, SEVERITY_META, SEVERITY_ORDER, severityOf, type Severity } from "../threatInfo";
 
@@ -96,6 +99,10 @@ export default function AlertDrawer({ open, onClose, alerts, isComplete, totalFl
         </div>
 
         <div className="drawer-body">
+          {/* Phase 1: ledger status + attack campaigns (each hides itself until the backend answers) */}
+          <LedgerPanel />
+          <CampaignTimeline />
+
           {isComplete && (
             <SummaryReport alerts={alerts} totalFlows={totalFlows} flaggedIpCount={flaggedIpCount} />
           )}

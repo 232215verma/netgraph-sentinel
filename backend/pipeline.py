@@ -9,6 +9,11 @@ shape it describes:
 so the dashboard can draw a real star (port scan) / hub (DDoS) / fan-out
 (DGA) instead of a single line. The alert saved to the database is the
 original one, without the "graph" field.
+
+PHASE 1 changes (marked "PHASE 1"):
+  - the broadcast alert now carries its database id (save_alert returns it),
+    so the dashboard's 30 s poll no longer re-adds alerts it already has
+  - flows from IPs blocked by the (simulated) external firewall are dropped
 """
 
 import asyncio
@@ -16,6 +21,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+import replayer  # PHASE 1: simulated external firewall state (BLOCKED_IPS)
 from flow_parser import load_and_normalize, normalize_flows
 from detector import detect_flows
 from database import save_alert
@@ -40,6 +46,15 @@ DEMO_NARRATION = {
 
 def _alert_key(alert: dict) -> tuple:
     return (alert["type"], alert.get("source"), alert.get("target"))
+
+
+# PHASE 1 -------------------------------------------------------------------
+def _drop_blocked(batch: pd.DataFrame) -> pd.DataFrame:
+    """Flows from IPs the external firewall has blocked never reach the sensor."""
+    if replayer.BLOCKED_IPS:
+        return batch[~batch["src_ip"].isin(replayer.BLOCKED_IPS)]
+    return batch
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -105,8 +120,8 @@ async def _emit_new_alerts(alerts: list[dict], accumulated: pd.DataFrame,
         graph_alerts = []
 
     for alert in new_alerts:
-        save_alert(alert)  # original alert, unchanged
-        enriched = {**alert, "graph": _graph_for_alert(alert, graph_alerts)}
+        alert_id = save_alert(alert)  # PHASE 1: original alert saved unchanged; returns its DB id
+        enriched = {**alert, "id": alert_id, "graph": _graph_for_alert(alert, graph_alerts)}
         await ws_manager.broadcast({"event": "alert", "alert": enriched})
 
 
@@ -128,7 +143,7 @@ async def run_simulation(csv_path: str, ws_manager, batch_size: int = 20, delay_
     await ws_manager.broadcast({"event": "simulation_started", "total_flows": total})
 
     for start in range(0, total, batch_size):
-        batch = flows.iloc[start:start + batch_size]
+        batch = _drop_blocked(flows.iloc[start:start + batch_size])  # PHASE 1
         accumulated = pd.concat([accumulated, batch], ignore_index=True)
         batch_num += 1
 
@@ -181,7 +196,7 @@ async def run_single_attack_demo(attack_key: str, ws_manager, delay_seconds: flo
     await ws_manager.broadcast({"event": "simulation_started", "total_flows": total})
 
     for start in range(0, total, batch_size):
-        batch = flows.iloc[start:start + batch_size]
+        batch = _drop_blocked(flows.iloc[start:start + batch_size])  # PHASE 1
         accumulated = pd.concat([accumulated, batch], ignore_index=True)
         batch_num += 1
 

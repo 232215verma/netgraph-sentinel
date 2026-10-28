@@ -3,6 +3,11 @@ NetGraph Sentinel — Phase 1: Replayer
 
 Streams normalized flow data in small time-ordered batches, simulating a
 live one-way traffic feed (since we don't have a real data diode to tap).
+
+PHASE 1 addition: a registry of IPs blocked by the (simulated) out-of-band
+firewall. VYUH itself never blocks anything; this only models what the
+EXTERNAL firewall does after an analyst orders a block, i.e. new flows
+from that IP stop arriving.
 """
 
 import time
@@ -12,6 +17,28 @@ from typing import Iterator
 import pandas as pd
 
 from flow_parser import load_and_normalize
+
+# ===========================================================================
+# PHASE 1: simulated external firewall state
+# ===========================================================================
+BLOCKED_IPS: set[str] = set()
+
+
+def block_ip(ip: str) -> None:
+    BLOCKED_IPS.add(ip)
+
+
+def unblock_ip(ip: str) -> None:
+    BLOCKED_IPS.discard(ip)
+
+
+def clear_blocked() -> None:
+    BLOCKED_IPS.clear()
+
+
+def is_blocked(ip: str) -> bool:
+    return ip in BLOCKED_IPS
+# ===========================================================================
 
 
 def replay_flows(
@@ -32,6 +59,15 @@ def replay_flows(
     total = len(flows)
     for start in range(0, total, batch_size):
         batch = flows.iloc[start : start + batch_size]
+
+        # PHASE 1: drop flows from IPs the external firewall has blocked
+        if BLOCKED_IPS:
+            batch = batch[~batch["src_ip"].isin(BLOCKED_IPS)]
+            if batch.empty:
+                if delay_seconds > 0 and start + batch_size < total:
+                    time.sleep(delay_seconds)
+                continue
+
         yield batch
         if delay_seconds > 0 and start + batch_size < total:
             time.sleep(delay_seconds)

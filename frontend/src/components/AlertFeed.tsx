@@ -1,6 +1,14 @@
-import { useState, type CSSProperties } from "react";
+import { useMemo, useState, type CSSProperties } from "react";
 import { Alert } from "../types";
 import { THREAT_INFO, SEVERITY_META, LAYER_LABELS, severityOf, alertKey } from "../threatInfo";
+// Phase 1: node state + campaign badges, and the analyst "Isolate" action
+import {
+  NODE_STATE_META,
+  confirmAndIsolate,
+  useCampaigns,
+  useNodeStates,
+  type Campaign,
+} from "../phase1";
 
 const API_BASE = import.meta.env.VITE_API_URL || "https://vyuh-threat-detection.onrender.com";
 
@@ -22,6 +30,27 @@ interface Props {
 export default function AlertFeed({ alerts }: Props) {
   const [briefs, setBriefs] = useState<Record<string, Brief>>({});
   const [loading, setLoading] = useState<string | null>(null);
+
+  // Phase 1
+  const nodeStates = useNodeStates();
+  const campaigns = useCampaigns();
+  const [isolating, setIsolating] = useState<string | null>(null);
+  const campaignByIp = useMemo(() => {
+    const m = new Map<string, Campaign>();
+    for (const c of campaigns) m.set(c.src_ip, c);
+    return m;
+  }, [campaigns]);
+
+  const isolate = async (ip: string) => {
+    setIsolating(ip);
+    try {
+      await confirmAndIsolate(ip);
+    } catch {
+      window.alert("The response request could not be sent. Check that the backend is running.");
+    } finally {
+      setIsolating(null);
+    }
+  };
 
   const showOnGraph = (alert: Alert) => {
     window.dispatchEvent(new CustomEvent<Alert>(SHOW_SHAPE_EVENT, { detail: alert }));
@@ -79,6 +108,11 @@ export default function AlertFeed({ alerts }: Props) {
         const brief = briefs[key];
         const pct = Math.round(alert.confidence * 100);
 
+        // Phase 1
+        const nodeState = alert.source ? nodeStates[alert.source] : undefined;
+        const campaign = alert.source ? campaignByIp.get(alert.source) : undefined;
+        const canIsolate = !!alert.source && (nodeState === "suspicious" || nodeState === "compromised");
+
         return (
           <div
             key={alert.id ?? `${key}-${i}`}
@@ -92,6 +126,28 @@ export default function AlertFeed({ alerts }: Props) {
                 {sev.label}
               </span>
             </div>
+
+            {/* Phase 1: node state + campaign badges */}
+            {((nodeState && nodeState !== "normal") || campaign) && (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", margin: "6px 0" }}>
+                {nodeState && nodeState !== "normal" && (
+                  <span
+                    className="sev"
+                    style={{
+                      background: `${NODE_STATE_META[nodeState].color}22`,
+                      color: NODE_STATE_META[nodeState].color,
+                    }}
+                  >
+                    {NODE_STATE_META[nodeState].label}
+                  </span>
+                )}
+                {campaign && (
+                  <span className="mitre-tag">
+                    Campaign · {campaign.stages.length} {campaign.stages.length === 1 ? "stage" : "stages"}
+                  </span>
+                )}
+              </div>
+            )}
 
             <div className="conf">
               <div className="conf-bar">
@@ -132,6 +188,16 @@ export default function AlertFeed({ alerts }: Props) {
               {!brief && (
                 <button className="btn btn-ghost btn-sm" disabled={loading === key} onClick={() => explain(alert)}>
                   {loading === key ? "Analyzing…" : "Explain alert"}
+                </button>
+              )}
+              {/* Phase 1: analyst response via separate channel */}
+              {canIsolate && (
+                <button
+                  className="btn btn-ghost btn-sm"
+                  disabled={isolating === alert.source}
+                  onClick={() => isolate(alert.source as string)}
+                >
+                  {isolating === alert.source ? "Sending…" : "Isolate attacker"}
                 </button>
               )}
             </div>

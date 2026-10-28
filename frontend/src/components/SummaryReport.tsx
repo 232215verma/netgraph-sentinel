@@ -1,5 +1,8 @@
 import { Alert } from "../types";
 import { THREAT_INFO } from "../threatInfo";
+// Phase 1: campaign + ledger status in the run summary
+import { CampaignSummaryLine } from "./CampaignTimeline";
+import { LedgerBadge } from "./LedgerPanel";
 
 interface Props {
   alerts: Alert[];
@@ -43,6 +46,10 @@ export default function SummaryReport({ alerts, totalFlows, flaggedIpCount }: Pr
         )}{" "}
         at <b>{(top.confidence * 100).toFixed(0)}%</b> confidence.
       </p>
+
+      {/* Phase 1 */}
+      <CampaignSummaryLine />
+
       <div className="summary-tags">
         {Object.entries(typeCounts).map(([type, count]) => {
           const info = THREAT_INFO[type];
@@ -54,6 +61,8 @@ export default function SummaryReport({ alerts, totalFlows, flaggedIpCount }: Pr
             </span>
           );
         })}
+        {/* Phase 1 */}
+        <LedgerBadge />
       </div>
     </div>
   );

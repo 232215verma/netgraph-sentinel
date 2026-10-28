@@ -1,23 +1,44 @@
 """
 NetGraph Sentinel — Backend (Phase 4/7/8: Full pipeline + demo controls + RAG explanations)
+
+PHASE 1 additions: Attack Arena, node states, campaigns, analyst isolation,
+tamper-evident ledger verification (see the "PHASE 1" block).
 """
 
 import asyncio
+import ipaddress
+import os
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from database import init_db, get_alerts, clear_alerts
 from pipeline import run_simulation, run_single_attack_demo, run_full_demo_sequence
 
-app = FastAPI(title="NetGraph Sentinel API", version="0.8.0")
+# PHASE 1
+import replayer
+from arena import run_kill_chain, run_single_attack, spawn
+from campaigns import isolate_node
+from database import (
+    get_node_states,
+    list_campaigns,
+    tamper_latest_alert,
+    verify_ledger,
+)
+from traffic_generator import ARENA_KINDS
+
+app = FastAPI(title="NetGraph Sentinel API", version="0.9.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origins=[
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:5174", "http://127.0.0.1:5174",
+    ],
+    # vercel deployments + any local dev port (Vite moves to 5174, 5175... if 5173 is busy)
+    allow_origin_regex=r"https://.*\.vercel\.app|http://(localhost|127\.0\.0\.1):\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -115,6 +136,7 @@ def list_alerts(limit: int = 100):
 @app.delete("/api/alerts")
 def delete_alerts():
     clear_alerts()
+    replayer.clear_blocked()  # PHASE 1: reset = ledger, campaigns, node states AND the simulated firewall
     return {"status": "cleared"}
 
 
@@ -132,3 +154,89 @@ async def websocket_live(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+
+# ===========================================================================
+# PHASE 1: Attack Arena, response, campaigns, ledger
+# ===========================================================================
+DEMO_MODE = os.getenv("DEMO_MODE", "1") == "1"  # set DEMO_MODE=0 to disable /api/demo/tamper
+
+
+class AttackLaunchRequest(BaseModel):
+    type: str                 # PortScan | DDoS | C2Beaconing | DGA | DNSTunneling | Exfiltration
+    attacker_ip: str
+    target_ip: str
+    mode: str = "single"      # single | killchain
+
+
+class IsolateRequest(BaseModel):
+    ip: str
+    analyst: str = "analyst"
+
+
+def _check_ip(value: str, label: str) -> str:
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"{label} is not a valid IP address")
+
+
+@app.post("/api/attack/launch")
+async def attack_launch(req: AttackLaunchRequest):
+    if req.type not in ARENA_KINDS:
+        raise HTTPException(status_code=400, detail=f"Unknown attack type. Valid: {sorted(ARENA_KINDS)}")
+    if req.mode not in ("single", "killchain"):
+        raise HTTPException(status_code=400, detail="mode must be 'single' or 'killchain'")
+
+    attacker = _check_ip(req.attacker_ip, "attacker_ip")
+    target = _check_ip(req.target_ip, "target_ip")
+    if attacker == target:
+        raise HTTPException(status_code=422, detail="attacker_ip and target_ip must differ")
+    if replayer.is_blocked(attacker):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{attacker} is quarantined. Use another attacker IP or reset via DELETE /api/alerts.",
+        )
+
+    if req.mode == "killchain":
+        spawn(run_kill_chain(attacker, target, manager))
+    else:
+        spawn(run_single_attack(req.type, attacker, target, manager))
+    return {"ok": True, "mode": req.mode, "attacker_ip": attacker}
+
+
+@app.get("/api/node-states")
+def node_states():
+    """ip -> state, only for hosts that are not 'normal'."""
+    return {"states": get_node_states()}
+
+
+@app.get("/api/campaigns")
+def campaigns():
+    return {"campaigns": list_campaigns()}
+
+
+@app.post("/api/respond/isolate")
+def respond_isolate(req: IsolateRequest):
+    """
+    Analyst response. VYUH stays read-only: this marks the node quarantined and
+    calls the SIMULATED out-of-band firewall hook (see campaigns.firewall_webhook).
+    """
+    ip = _check_ip(req.ip, "ip")
+    result = isolate_node(ip, req.analyst)
+    return {"ok": True, **result}
+
+
+@app.get("/api/ledger/verify")
+def ledger_verify():
+    return verify_ledger()
+
+
+@app.post("/api/demo/tamper")
+def demo_tamper():
+    if not DEMO_MODE:
+        raise HTTPException(status_code=403, detail="Tamper demo is disabled (DEMO_MODE=0)")
+    alert_id = tamper_latest_alert()
+    if alert_id is None:
+        raise HTTPException(status_code=404, detail="No ledgered alert to tamper with yet")
+    return {"ok": True, "tampered_alert_id": alert_id}
